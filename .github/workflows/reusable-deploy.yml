@@ -50,12 +50,31 @@ on:
       smoke_timeout:
         description: "Timeout in seconds for smoke test."
         required: false
-        default: 120
+        default: 90
         type: number
       smoke_check_command:
         description: "Optional custom smoke command to run in app container (e.g., python src/manage.py check)."
         required: false
         type: string
+      smoke_port:
+        description: "Port for local HTTP smoke when base_url is not provided (default 8000)."
+        required: false
+        default: 8000
+        type: number
+      base_url:
+        description: "Optional absolute base URL for smoke (overrides smoke_port)."
+        required: false
+        type: string
+      smoke_mode:
+        description: "Smoke strategy: curl_only (default) or in_container_http_then_cmd."
+        required: false
+        default: "curl_only"
+        type: string
+      cleanup_cache:
+        description: "If true, prune Docker cache at the end of jobs (slower, for debugging)."
+        required: false
+        default: false
+        type: boolean
     secrets:
       ANY_ENV_SPECIFIC_SECRET:
         required: false
@@ -160,28 +179,57 @@ jobs:
             sleep 3
           done
 
-      - name: Smoke test (curl)
-        if: steps.docker_check.outputs.has_docker == 'true' && inputs.smoke_check_command == ''
+      - name: Smoke test (curl_only)
+        if: steps.docker_check.outputs.has_docker == 'true' && inputs.smoke_mode == 'curl_only'
         shell: bash
         run: |
           set -euo pipefail
-          URL="http://127.0.0.1:8000${{ inputs.smoke_url }}"
+          if [ -n "${{ inputs.base_url }}" ]; then
+            URL="${{ inputs.base_url }}${{ inputs.smoke_url }}"
+          else
+            URL="http://127.0.0.1:${{ inputs.smoke_port }}${{ inputs.smoke_url }}"
+          fi
           end=$((SECONDS+${{ inputs.smoke_timeout }}))
           until curl -fsS "$URL" >/dev/null; do
             [ $SECONDS -ge $end ] && { echo "Smoke failed for $URL"; exit 1; }
             sleep 3
           done
 
-      - name: Smoke test (custom command in app)
-        if: steps.docker_check.outputs.has_docker == 'true' && inputs.smoke_check_command != ''
+      - name: Smoke test (in_container_http_then_cmd)
+        if: steps.docker_check.outputs.has_docker == 'true' && inputs.smoke_mode == 'in_container_http_then_cmd'
         shell: bash
         run: |
           set -euo pipefail
-          docker compose run --rm app sh -lc '${{ inputs.smoke_check_command }}'
+          if [ -n "${{ inputs.base_url }}" ]; then
+            SMOKE_URL="${{ inputs.base_url }}${{ inputs.smoke_url }}"
+          else
+            SMOKE_URL="http://127.0.0.1:${{ inputs.smoke_port }}${{ inputs.smoke_url }}"
+          fi
+          end=$((SECONDS+${{ inputs.smoke_timeout }}))
+          while true; do
+            if docker compose exec -T -e SMOKE_URL="$SMOKE_URL" app python -c "import os,sys,urllib.request as u; import urllib.error;\ntry:\n u.urlopen(os.environ['SMOKE_URL'], timeout=2); sys.exit(0)\nexcept Exception:\n sys.exit(1)"; then
+              break
+            fi
+            [ $SECONDS -ge $end ] && { echo "Timeout waiting for $SMOKE_URL"; exit 1; }
+            sleep 2
+          done
+          if [ -n "${{ inputs.smoke_check_command }}" ]; then
+            docker compose exec -T app sh -lc '${{ inputs.smoke_check_command }}'
+          fi
 
       - name: Rollback on failure
         if: failure() && steps.docker_check.outputs.has_docker == 'true'
         run: docker compose down -v || true
+
+      - name: Cleanup Docker cache (staging)
+        if: always() && inputs.cleanup_cache == true
+        run: |
+          docker system df || true
+          docker image prune -af || true
+          docker builder prune -af || true
+          docker container prune -f || true
+          docker volume prune -f || true
+          docker system df || true
 
   gatekeeper_approval:
     name: Manual approval gate
@@ -274,24 +322,43 @@ jobs:
           fi
           docker compose up -d
 
-      - name: Smoke test (curl)
-        if: steps.docker_check.outputs.has_docker == 'true' && steps.nodocker_mark.outputs.marked != 'true' && inputs.smoke_check_command == ''
+      - name: Smoke test (curl_only)
+        if: steps.docker_check.outputs.has_docker == 'true' && steps.nodocker_mark.outputs.marked != 'true' && inputs.smoke_mode == 'curl_only'
         shell: bash
         run: |
           set -euo pipefail
-          URL="http://127.0.0.1:8000${{ inputs.smoke_url }}"
+          if [ -n "${{ inputs.base_url }}" ]; then
+            URL="${{ inputs.base_url }}${{ inputs.smoke_url }}"
+          else
+            URL="http://127.0.0.1:${{ inputs.smoke_port }}${{ inputs.smoke_url }}"
+          fi
           end=$((SECONDS+${{ inputs.smoke_timeout }}))
           until curl -fsS "$URL" >/dev/null; do
             [ $SECONDS -ge $end ] && { echo "Smoke failed for $URL"; exit 1; }
             sleep 3
           done
 
-      - name: Smoke test (custom command)
-        if: steps.docker_check.outputs.has_docker == 'true' && steps.nodocker_mark.outputs.marked != 'true' && inputs.smoke_check_command != ''
+      - name: Smoke test (in_container_http_then_cmd)
+        if: steps.docker_check.outputs.has_docker == 'true' && steps.nodocker_mark.outputs.marked != 'true' && inputs.smoke_mode == 'in_container_http_then_cmd'
         shell: bash
         run: |
           set -euo pipefail
-          docker compose run --rm app sh -lc '${{ inputs.smoke_check_command }}'
+          if [ -n "${{ inputs.base_url }}" ]; then
+            SMOKE_URL="${{ inputs.base_url }}${{ inputs.smoke_url }}"
+          else
+            SMOKE_URL="http://127.0.0.1:${{ inputs.smoke_port }}${{ inputs.smoke_url }}"
+          fi
+          end=$((SECONDS+${{ inputs.smoke_timeout }}))
+          while true; do
+            if docker compose exec -T -e SMOKE_URL="$SMOKE_URL" app python -c "import os,sys,urllib.request as u; import urllib.error;\ntry:\n u.urlopen(os.environ['SMOKE_URL'], timeout=2); sys.exit(0)\nexcept Exception:\n sys.exit(1)"; then
+              break
+            fi
+            [ $SECONDS -ge $end ] && { echo "Timeout waiting for $SMOKE_URL"; exit 1; }
+            sleep 2
+          done
+          if [ -n "${{ inputs.smoke_check_command }}" ]; then
+            docker compose exec -T app sh -lc '${{ inputs.smoke_check_command }}'
+          fi
 
       - name: No-op on runners without Docker or marked as no-docker
         if: steps.docker_check.outputs.has_docker != 'true' || steps.nodocker_mark.outputs.marked == 'true'
@@ -300,6 +367,16 @@ jobs:
       - name: Rollback on failure
         if: failure() && steps.docker_check.outputs.has_docker == 'true' && steps.nodocker_mark.outputs.marked != 'true'
         run: docker compose down -v || true
+
+      - name: Cleanup Docker cache (prod)
+        if: always() && inputs.cleanup_cache == true
+        run: |
+          docker system df || true
+          docker image prune -af || true
+          docker builder prune -af || true
+          docker container prune -f || true
+          docker volume prune -f || true
+          docker system df || true
 
   notify_failure:
     name: Notify on failure (optional)

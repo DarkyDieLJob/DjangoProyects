@@ -8,16 +8,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Estáticos: habilitar si quieres recopilar estáticos en runtime
       - ENABLE_COLLECTSTATIC=false
-      # Desactiva frontend si no quieres construir Tailwind (por defecto se construye)
       - NO_FRONTEND=false
     volumes:
       - ${HOST_PERSIST:-.}/persist/env/.env:/app/src/.env:ro
       - ${HOST_PERSIST:-.}/persist/media:/app/src/media
       - ${HOST_PERSIST:-.}/persist/data:/app/src/data
       - ${HOST_PERSIST:-.}/persist/logs:/app/logs
-    # Nota: sin depends_on para no forzar perfiles opcionales (db/broker) en base
     healthcheck:
       test: ["CMD-SHELL", "python src/manage.py check --deploy || exit 1"]
       interval: 10s
@@ -25,6 +22,15 @@ services:
       retries: 6
       start_period: 15s
     command: ["python", "src/manage.py", "runserver", "0.0.0.0:8000"]
+
+  app_withdeps:
+    <<: *app_base
+    profiles: ["appdeps"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   db:
     profiles: ["db"]

@@ -298,3 +298,6 @@ Thumbs.db
 tmp_host/**/db_default.sqlite3*
 temp_host/**/db_default.sqlite3*
 tmp_persist/**/db_default.sqlite3*
+
+# Ignore root-level temp deployment folders
+/tmp_*/

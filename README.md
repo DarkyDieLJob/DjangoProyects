@@ -8,3 +8,6 @@ Plantilla base para proyectos Django con arquitectura limpia, CLI unificado y do
 Notas importantes:
 - Persistencia: usamos `persist/` por host (ver sección correspondiente en docs).
 - Este README del padre es genérico. Los hijos deben mantener su propio README específico y NO se sincroniza desde el padre (evita ruido en diffs). 
+
+## Agentes y gh
+- Ver `docs/RELEASE_WITH_GH.md` para flujo de PRs con gh y release por tags.

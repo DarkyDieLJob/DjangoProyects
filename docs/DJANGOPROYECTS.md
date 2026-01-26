@@ -51,6 +51,40 @@ Aplicación básica para la creación de proyectos Django con arquitectura limpi
   }
   ```
 
+### Patrón de persistencia centralizada (persist/)
+
+- Todos los datos no versionados (secrets, media, data, logs) se centralizan en una carpeta única por host: `persist/` fuera del repositorio.
+- Bind mounts estándar desde el host al contenedor, parametrizados por `HOST_PERSIST` con default `.` para desarrollo local:
+  - `${HOST_PERSIST:-.}/persist/env/.env` → `/app/src/.env` (solo lectura)
+  - `${HOST_PERSIST:-.}/persist/media` → `/app/src/media`
+  - `${HOST_PERSIST:-.}/persist/data` → `/app/src/data`
+  - `${HOST_PERSIST:-.}/persist/logs` → `/app/logs`
+- Beneficios: resiliencia ante rebuilds/restarts/compose down, backups centralizados, menor drift entre entornos.
+- Tradeoffs: gestionar permisos UID/GID del usuario que ejecuta Docker/runner, .env en RO (640), menor aislamiento que named volumes pero mayor auditabilidad.
+- Notas SELinux/AppArmor (si aplica): puede requerir ajustar contextos o políticas para permitir bind mounts.
+  - SELinux: `chcon -Rt svirt_sandbox_file_t $HOST_PERSIST/persist` o usar `:z`/`:Z` cuando corresponda.
+  - AppArmor: verificar perfiles activos y permitir montajes en la ruta destino.
+
+### Healthchecks y orden de arranque seguro
+
+- db (Postgres): `pg_isready` con `interval`, `timeout`, `retries` y `start_period` configurados para tolerar latencia.
+- redis: `redis-cli ping` como verificación ligera del broker.
+- app: `python src/manage.py check --deploy` como check ligero de Django (no depende de endpoint).
+- worker (si aplica): `python src/manage.py check`.
+
+`depends_on` con `condition: service_healthy` garantiza que `app` y `worker` esperen a `db`/`redis` listos, evitando errores por latencia o dependencias no inicializadas.
+
+### Migraciones controladas (previas al up -d)
+
+Ejecuta migraciones explícitamente antes de levantar servicios para evitar condiciones de carrera y arranques fallidos.
+
+```bash
+docker compose run --rm app python src/manage.py migrate
+docker compose up -d [--profile db] [--profile broker] [--profile worker]
+```
+
+Beneficios: orden determinístico, menos fallos en arranque, y despliegues más estables. Tradeoff: pequeño tiempo extra en el pipeline (aceptable en producción).
+
 ### Frontend
 - **Tailwind CSS** para estilos
 - **Estructura típica** (opcional):
@@ -252,6 +286,60 @@ python -m pytest -q
 3. **Scaffolding**: `templates/app_templates/` se usa solo como plantilla de referencia. Nunca se ejecutan tests ni se mide cobertura allí. Al crear una nueva app, copiar la estructura a `src/<nueva_app>/` y recién entonces agregar código y tests.
 4. **Frontend**: Los scripts generan `frontend/` y compilan Tailwind a `static/css/tailwind.css`. Incluye el CSS en tus plantillas con `{% static 'css/tailwind.css' %}`.
 
+## Perfiles de build y frontend condicional
+
+- **Objetivo**: permitir imágenes de producción ligeras sin Node/npm cuando el frontend no es necesario, y habilitar un target alternativo con assets precompilados cuando sí se requiere.
+
+- **Targets del Dockerfile**:
+  - `runtime`: imagen final sin Node/npm (recomendada para producción sin frontend).
+  - `runtime-frontend`: imagen final que copia los estáticos construidos por un stage Node (sin incluir Node en runtime).
+
+- **Build recomendado (buildx)**:
+  - Sin frontend (amd64):
+    ```bash
+    docker buildx build --target runtime --platform linux/amd64 -t app:latest .
+    ```
+  - Con frontend (amd64):
+    ```bash
+    docker buildx build --target runtime-frontend --platform linux/amd64 -t app:with-frontend .
+    ```
+  - ARM (RPi): arm64
+    ```bash
+    docker buildx build --target runtime --platform linux/arm64 -t app:arm64 .
+    ```
+  - ARM (RPi): armv7
+    ```bash
+    docker buildx build --target runtime --platform linux/arm/v7 -t app:armv7 .
+    ```
+
+- **Flags de runtime (entrypoint)**:
+  - `NO_FRONTEND=true`: desactiva pasos de Node/Tailwind en runtime.
+  - `ENABLE_COLLECTSTATIC=true`: ejecuta `collectstatic` en arranque (opcional).
+  - `RUN_MAKEMIGRATIONS=false`: desactiva `makemigrations` en arranque (por defecto true en la plantilla).
+
+- **Notas**:
+  - Preferir `--target` por sobre `--build-arg ENABLE_FRONTEND=0` para evitar construir stages innecesarios.
+  - El stage `runtime-frontend` copia únicamente los artefactos requeridos (por ejemplo, `static/css/tailwind.css`).
+  - Integración con Compose: activar el perfil `frontend` solo cuando se utilice `runtime-frontend` y/o se necesite servir assets adicionales.
+
+### Ignorados recomendados y por qué
+
+- **Runtime/artefactos** (frontend/, node_modules/, src/static/, src/staticfiles/, src/media/, logs/): generados en build/ejecución, reproducibles; no deben entrar al historial.
+- **Persistencia y secretos** (/persist/**, src/.env, .env*): la persistencia vive fuera del repo; ignorar secretos evita fugas accidentales.
+- **Caches/cobertura** (__pycache__/, .pytest_cache/, htmlcov/, .coverage*): ruido y tamaño innecesario.
+- **Migraciones (plantilla)**: ignoramos `src/**/migrations/*.py` salvo `__init__.py` para evitar acoplar el template a un estado de DB concreto. Los hijos pueden versionarlas con un override local si lo requieren.
+- **IDEs/tooling** (.idea/, .vscode/, .ruff_cache/, .ipynb_checkpoints/, .mypy_cache/, .pytype/): específicos del entorno del desarrollador.
+
+Overrides en hijos (si necesitan versionar algo ignorado):
+
+```gitignore
+!src/**/migrations/*.py
+# o granular, por app
+!src/app_x/migrations/*.py
+```
+
+Sugerencia: si empleas pre-commit, agrega un hook que alerte sobre intentos de commitear `.env` o `persist/`.
+
 ## Flujo de ramas y commits (resumen)
 
 Sigue `docs/GIT_AGENTES.md`:
@@ -270,3 +358,220 @@ Convencional Commits (resumen):
   - `chore(docker): añadir .dockerignore`
   - `feat(deps): crear requirements/runtime.txt para producción`
   - `docs(docker): instrucciones de build y uso (compose con restart always)`
+
+## CLI de gestión del proyecto
+
+El proyecto incluye un CLI genérico `project_manage.py` y un `Makefile` que delega en él para estandarizar operaciones comunes.
+
+Comandos principales:
+- `up`: Levanta servicios (`docker compose up -d`). Flags: `--profile`, `--build`.
+- `down`: Detiene y elimina (`docker compose down`). Flags: `--volumes`, `--remove-orphans`.
+- `restart`: Reinicia servicios. Flags: `--services`.
+- `rebuild`: Reconstruye imágenes. Flags: `--no-cache`, `--pull`, `--profile`.
+- `logs`: Muestra logs. Flags: `-f/--follow`, `--since`, `--tail`, `--services`.
+- `migrate`: Ejecuta migraciones controladas. Flag: `--makemigrations` (opcional; por defecto no ejecuta).
+- `status`: Estado de servicios (`docker compose ps`).
+- `trigger` (opcional): Dispara una tarea Celery si worker/broker están activos.
+- `compose`: Passthrough a `docker compose` para casos avanzados.
+- `info`: Muestra contexto (perfiles, servicios, flags de entrypoint, etc.).
+
+Uso con Makefile (atajos):
+- `make up`, `make down`, `make logs`, `make migrate`, `make status`, `make info`.
+
+Variables útiles (se propagan):
+- `PROFILE`/`PROFILES`: perfiles de compose (p. ej. `db,broker,worker`).
+- `SERVICES`: lista de servicios (p. ej. `app,worker`).
+- `FOLLOW=1`: seguir logs (`-f`).
+
+Extensión en hijos:
+- Crear `Makefile.local` con targets propios, por ejemplo:
+  ```make
+  custom-task:
+  	python project_manage.py compose -- exec app python src/manage.py custom_command
+  ```
+
+Racional:
+- Consistencia entre padre e hijos, menos comandos largos de compose, tolerancia a perfiles opcionales.
+
+## Perfiles de ejecución con docker compose
+
+Perfiles disponibles:
+- base (implícito): solo `app` con SQLite. No requiere `--profile`.
+- db: agrega `db` (Postgres) con volumen persistente `persist/data/postgres`.
+- broker: agrega `redis` con volumen `persist/data/redis` (opcional).
+- worker: agrega `worker` (Celery) que depende de `db` y `redis` cuando están activos.
+- frontend: agrega un servicio ligero para servir estáticos (p. ej., Nginx). Úsalo solo si tu hijo lo necesita.
+
+Cómo activarlos:
+```bash
+# App + DB
+docker compose --profile db up -d
+
+# App + DB + Broker
+docker compose --profile db --profile broker up -d
+
+# App + DB + Broker + Worker (sin frontend)
+docker compose --profile db --profile broker --profile worker up -d
+
+# Con CLI/Makefile
+PROFILE=db,broker,worker make up
+python project_manage.py up --profile db,broker,worker
+```
+
+Beneficios:
+- Padre minimalista por defecto: hijos sin DB/Celery no cargan servicios innecesarios.
+- Control granular por entorno: activa solo lo que necesitas.
+
+Tradeoffs:
+- Debes indicar `--profile` cuando requieras servicios opcionales.
+- Mitigación: usa `PROFILE=... make up` o `project_manage.py up --profile ...`.
+
+## Toggles de configuración (settings modulares)
+
+Los ajustes del proyecto se parametrizan vía `.env` (python-decouple). Principales toggles:
+
+- `USE_POSTGRES` (bool, default False):
+  - False → SQLite por defecto.
+  - True → Configura Postgres con `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`.
+- `CELERY_ENABLED` (bool, default False): habilita configuración de Celery. No requiere que el perfil `worker` esté activo para correr la app.
+- `WHITENOISE_ENABLED` (bool, default `not DEBUG`): sirve estáticos en producción con WhiteNoise.
+- `ALLAUTH_ENABLED` (bool, default True) y `ALLAUTH_PROVIDERS` (CSV: `github,google`): añade proveedores de autenticación social condicionalmente.
+- `ALLOWED_HOSTS` (CSV), `CSRF_TRUSTED_ORIGINS` (CSV): seguridad por entorno.
+- `DEBUG_INFO` (bool, default False): incrementa logging en staging/desarrollo.
+
+Ejemplos:
+```env
+DEBUG=False
+USE_POSTGRES=True
+POSTGRES_HOST=db
+CELERY_ENABLED=True
+ALLAUTH_PROVIDERS=github
+```
+
+Relación con perfiles de compose:
+- Activa sólo los perfiles necesarios en Docker (`db`, `broker`, `worker`). Los toggles no fuerzan servicios; sólo parametrizan la app.
+
+## Navbar y footer heredable (branding hijo y atribución padre)
+
+- Objetivo: separar branding del hijo (navbar) de la atribución del padre (footer) con un contrato de contexto estable y toggles de visibilidad.
+- Context processor `core_app.context_processors.ui_meta` expone:
+  - `app_name`, `app_version`
+  - `template_name`, `template_version`
+  - `show_project_version` (bool, default True)
+  - `show_template_attrib` (bool, default True)
+  - `template_attrib_minimal` (bool, default False)
+  - `show_template_version_in_nav` (bool, default False)
+  - `show_footer_year` (bool, default True)
+
+- Fuentes de versión:
+  - Hijo (`app_version`): `ENV APP_VERSION` > `CHANGELOG.md` del hijo > fallback `dev`.
+  - Padre (`template_version`): constantes en `src/template_meta.py` (`TEMPLATE_NAME`, `TEMPLATE_VERSION`) > fallback `unknown`.
+
+- Plantilla base (`src/templates/base.html`):
+  - Navbar: bloque `navbar_brand` muestra `{{ app_name }}` y si `show_project_version` entonces `v{{ app_version }}`. Opcionalmente `show_template_version_in_nav`.
+  - Navbar: bloque `navbar_right` para que los hijos inserten acciones (login, etc.).
+  - Footer: incluye atribución al padre si `show_template_attrib`. Con `template_attrib_minimal` muestra solo el nombre del template; si no, incluye `template_version`.
+  - `footer_extra`: bloque opcional para contenido extra.
+
+- Recomendaciones:
+  - En producción: `SHOW_PROJECT_VERSION=true`, `SHOW_TEMPLATE_ATTRIB=true`, `TEMPLATE_ATTRIB_MINIMAL=true`, `SHOW_TEMPLATE_VERSION_IN_NAV=false`.
+  - En staging/QA: `SHOW_TEMPLATE_ATTRIB=true`, `TEMPLATE_ATTRIB_MINIMAL=false` para depurar versiones del padre.
+  - En CI/CD, fija `APP_VERSION` desde el tag (`vX.Y.Z`) al invocar el deploy.
+
+- Ejemplo de footer (completo):
+  - "© 2026 {{app_name}} v{{app_version}}. Todos los derechos reservados. Este proyecto está basado en {{template_name}} v{{template_version}}."
+
+
+## Estrategia de documentación modular (padre vs hijos)
+
+- README del padre (este repo): breve y genérico; apunta a esta documentación.
+- README de cada hijo: específico y personalizado (nombre, propósito, enlaces, capturas). No se sincroniza desde el padre para evitar ruido en diffs.
+- Esta documentación (`docs/DJANGOPROYECTS.md`) es la fuente de verdad genérica y se actualiza desde el padre.
+
+Al migrar un hijo:
+- Actualiza el hijo con los cambios del padre en código y en `docs/DJANGOPROYECTS.md`.
+- No sobrescribas el `README.md` del hijo; edítalo manualmente para mantener lo específico y enlaza a `docs/DJANGOPROYECTS.md`.
+
+> Consulta también la guía operativa de adopción para proyectos hijos: [docs/MIGRACION_HIJOS.md](MIGRACION_HIJOS.md)
+
+## Pipeline CI/CD (base conceptual)
+
+- Objetivo: workflow reusable en el padre que los hijos invocan con inputs mínimos para desplegar con seguridad en runners self-hosted.
+- Flujo (resumen):
+  1) Tag semántico manual (vX.Y.Z)
+  2) Lint + tests rápidos
+  3) Staging (runner con Docker): build in situ (buildx), migraciones, up con perfiles, smoke/health, rollback si falla
+  4) Gatekeeper (aprobación manual)
+  5) Producción (matrix de runners): build in situ + smoke, o no-op en runners sin Docker
+
+- Runners y etiquetas: configurar labels por entorno (p.ej., `self-hosted`, `stage`, `docker`, `rpi`, `cloud-docker`, `cloud-nodocker`).
+- Inputs típicos del reusable: `profiles`, `target`, `platforms`, `staging_runner_label`, `prod_runner_matrix`, `migrate_before_up`, `collectstatic`, `smoke_url`, `smoke_timeout`, `smoke_check_command`.
+- Tradeoffs: control manual inicial (gatekeeper) vs. automatización; dependencia de runners activos; sin registry/SSH (builds en destino).
+- Uso en hijos: workflow mínimo que llama al reusable del padre (workflow_call) con sus inputs locales y secrets por entorno.
+
+## Pipeline CI/CD (ejecutable)
+
+- Objetivo: convertir el bosquejo en un workflow reusable operativo (`.github/workflows/reusable-deploy.yml`).
+- Disparador: los hijos lo invocan con `workflow_call` al pushear tags semánticos (`v*`).
+
+- Jobs principales:
+  - **lint_test**: corre en `ubuntu-latest`, sin Docker. Chequeos rápidos para validación universal.
+  - **staging_build_deploy**: corre en `runs-on: <inputs.staging_runner_label>`. Si hay Docker: `buildx` in situ, `migrate` opcional, `compose up -d` con perfiles, smoke (curl o comando custom), rollback `compose down -v` si falla. Timeout global: 30 min.
+  - **gatekeeper_approval**: requiere aprobación manual vía Environment `production` antes de promover.
+  - **prod_deploy**: matrix sobre labels recibidos. Si el runner tiene Docker y no está marcado como no-op: `buildx` in situ + `migrate`/`collectstatic` opcionales + `up -d` + smoke. Si no tiene Docker o está marcado como no-op: salta con éxito. Timeout global: 30 min.
+  - **notify_failure** (opcional): resume fallos sin exponer secretos.
+
+- Inputs del reusable (resumen):
+  - `tag_version` (str, opc): Tag a desplegar (default: ref actual).
+  - `profiles` (str, opc): CSV de perfiles de compose (`db,broker,worker,frontend`).
+  - `target` (str, opc, default `runtime`): Target del Dockerfile (`runtime`, `runtime-frontend`).
+  - `platforms` (str, opc): CSV de plataformas buildx (`linux/amd64,linux/arm64,...`).
+  - `staging_runner_label` (str, req): Label del runner de staging.
+  - `prod_runner_matrix_json` (str JSON, req): Array JSON con labels de runners de producción.
+  - `no_docker_runners` (str, opc): CSV de labels que deben ser no-op explícito en prod.
+  - `migrate_before_up` (bool, default true): Ejecuta migraciones antes de `up`.
+  - `collectstatic` (bool, default false): Ejecuta `collectstatic` antes de `up`.
+  - `smoke_url` (str, default `/`): Path relativo para smoke con `curl`.
+  - `smoke_timeout` (num, default 120): Timeout en segundos para smoke/wait.
+  - `smoke_check_command` (str, opc): Comando alternativo ejecutado con `docker compose run --rm app sh -lc '<cmd>'`.
+
+- Runners (configuración sugerida):
+  - Asignar labels claros: `self-hosted`, `stage`, `docker`, `rpi`, `cloud-docker`, `cloud-nodocker`.
+  - Asegurar Docker/Compose instalados donde corresponda. Donde no haya Docker, el job de prod hará no-op controlado.
+  - Usar Environment `production` con revisores requeridos para la aprobación manual.
+
+- Seguridad y logs:
+  - No imprimir secretos. Evitar `set -x`. Si un comando pudiera mostrar datos sensibles, enmascarar con `::add-mask::` previo.
+  - El workflow no hace `ssh` ni publica a registries: todos los builds son in situ en cada runner.
+
+- Ejemplo de llamada desde un hijo (workflow consumidor):
+
+  ```yaml
+  name: Deploy (child)
+  on:
+    push:
+      tags:
+        - 'v*'
+  jobs:
+    deploy:
+      uses: DarkyDieLJob/DjangoProyects/.github/workflows/reusable-deploy.yml@main
+      with:
+        tag_version: ${{ github.ref_name }}
+        profiles: 'db,broker,worker'
+        target: 'runtime'
+        platforms: 'linux/amd64,linux/arm64'
+        staging_runner_label: 'self-hosted-stage'
+        prod_runner_matrix_json: '["self-hosted","rpi"]'
+        no_docker_runners: 'rpi'
+        migrate_before_up: true
+        smoke_url: '/'
+        smoke_timeout: 120
+        smoke_check_command: ''
+      secrets: inherit
+  ```
+
+Notas:
+- Los hijos pueden ajustar `profiles` y `target` según su necesidad (p. ej., activar `frontend`).
+- Si una plataforma no está soportada nativamente, usar QEMU vía `platforms` (el reusable lo habilita cuando corresponda).
+- Para staging/producción, preparar `persist/` en el host y `.env` adecuados antes del primer deploy.
+

@@ -25,3 +25,6 @@ scripts/setup.sh
 
 # Salidas estáticas que se pueden regenerar
 static/css/tailwind.css
+
+# Temp deployment folders
+tmp_*/

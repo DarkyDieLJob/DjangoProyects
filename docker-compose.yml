@@ -1,6 +1,6 @@
 version: "3.9"
 services:
-  app:
+  app: &app_base
     build: .
     image: django-proyects:raspbian
     container_name: django-proyects
@@ -8,12 +8,84 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Estáticos: habilitar si quieres recopilar estáticos en runtime
       - ENABLE_COLLECTSTATIC=false
-      # Desactiva frontend si no quieres construir Tailwind (por defecto se construye)
       - NO_FRONTEND=false
-    # Opcional: montar volumen si quieres persistir DB sqlite fuera del contenedor
-    # volumes:
-    #   - ./src/data:/app/src/data
-    #   - ./static:/app/static
+    volumes:
+      - ${HOST_PERSIST:-.}/persist/env/.env:/app/src/.env:ro
+      - ${HOST_PERSIST:-.}/persist/media:/app/src/media
+      - ${HOST_PERSIST:-.}/persist/data:/app/src/data
+      - ${HOST_PERSIST:-.}/persist/logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "python src/manage.py check --deploy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
     command: ["python", "src/manage.py", "runserver", "0.0.0.0:8000"]
+
+  app_withdeps:
+    <<: *app_base
+    profiles: ["appdeps"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    profiles: ["db"]
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-app}
+      - POSTGRES_USER=${POSTGRES_USER:-app}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-app}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-app} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - ${HOST_PERSIST:-.}/persist/data/postgres:/var/lib/postgresql/data
+
+  redis:
+    profiles: ["broker"]
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - ${HOST_PERSIST:-.}/persist/data/redis:/data
+
+  worker:
+    profiles: ["worker"]
+    build: .
+    image: django-proyects:worker
+    restart: always
+    environment:
+      - NO_FRONTEND=true
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python src/manage.py check || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    command: ["bash", "-lc", "celery -A src.core_config worker -l info"]
+
+  frontend:
+    profiles: ["frontend"]
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./static:/usr/share/nginx/html:ro

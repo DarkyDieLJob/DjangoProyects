@@ -1,0 +1,105 @@
+name: Reusable Build & Push (GHCR)
+
+on:
+  workflow_call:
+    inputs:
+      image_repo:
+        description: "<org>/<app> repo name for GHCR (e.g., DarkyDieLJob/gestionferretereria)"
+        required: true
+        type: string
+      tags:
+        description: "CSV of tags to publish (e.g., staging-latest,test-20260129-1,sha-deadbee)"
+        required: true
+        type: string
+      context:
+        description: "Docker build context"
+        required: false
+        default: "."
+        type: string
+      dockerfile:
+        description: "Path to Dockerfile"
+        required: false
+        default: "Dockerfile"
+        type: string
+      platforms:
+        description: "CSV platforms for multi-arch"
+        required: false
+        default: "linux/amd64,linux/arm64"
+        type: string
+      build_args:
+        description: "Optional CSV build args KEY=VAL,KEY2=VAL2"
+        required: false
+        type: string
+    secrets:
+      GHCR_PAT:
+        required: true
+
+jobs:
+  build_push:
+    name: Build multi-arch and push to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Prepare tags and args
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra TAGS_ARR <<< "${{ inputs.tags }}"
+          tags_yaml=""
+          for t in "${TAGS_ARR[@]}"; do
+            t=$(echo "$t" | xargs)
+            [ -z "$t" ] && continue
+            tags_yaml+=$'\n''  - ghcr.io/${{ inputs.image_repo }}:'"$t"
+          done
+          echo "tags_yaml<<EOF" >> $GITHUB_OUTPUT
+          echo "$tags_yaml" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          # build args
+          args_lines=""
+          if [ -n "${{ inputs.build_args }}" ]; then
+            IFS=',' read -ra ARG_ARR <<< "${{ inputs.build_args }}"
+            for kv in "${ARG_ARR[@]}"; do
+              kv=$(echo "$kv" | xargs)
+              [ -z "$kv" ] && continue
+              args_lines+=$'\n''  - '"$kv"
+            done
+          fi
+          echo "args_yaml<<EOF" >> $GITHUB_OUTPUT
+          echo "$args_lines" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          platforms: ${{ inputs.platforms }}
+          tags: |
+            ${{ steps.prep.outputs.tags_yaml }}
+          build-args: |
+            ${{ steps.prep.outputs.args_yaml }}
+
+      - name: Output digest
+        id: digest
+        run: |
+            echo "DIGEST=$(cat $GITHUB_STEP_SUMMARY 2>/dev/null || true)" >> $GITHUB_OUTPUT

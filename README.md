@@ -11,3 +11,7 @@ Notas importantes:
 
 ## Agentes y gh
 - Ver `docs/RELEASE_WITH_GH.md` para flujo de PRs con gh y release por tags.
+ - Adopción ADR0025 (imágenes inmutables + GHCR): guía en [docs/ADR0025_ADOPCION.md](docs/ADR0025_ADOPCION.md)
+   - Workflows reusables provistos por el padre:
+     - `.github/workflows/reusable-build-push.yml`
+     - `.github/workflows/reusable-pull-deploy.yml`

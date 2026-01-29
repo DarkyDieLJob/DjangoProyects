@@ -1,0 +1,150 @@
+name: Reusable Pull Deploy (GHCR)
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: "Self-hosted or GitHub runner label to run the deploy job"
+        required: true
+        type: string
+      image_registry:
+        description: "Registry hostname"
+        required: false
+        default: "ghcr.io"
+        type: string
+      image_repo:
+        description: "<org>/<app> repo name for GHCR (e.g., DarkyDieLJob/gestionferreteria)"
+        required: true
+        type: string
+      image_tag:
+        description: "Tag to deploy (e.g., staging-latest, test-YYYYMMDD-N, vX.Y.Z)"
+        required: true
+        type: string
+      compose_files:
+        description: "CSV list of compose files"
+        required: false
+        default: "docker-compose.yml"
+        type: string
+      compose_project_name:
+        description: "Optional COMPOSE_PROJECT_NAME"
+        required: false
+        type: string
+      extra_env:
+        description: "Optional CSV list of KEY=VAL to export before compose"
+        required: false
+        type: string
+      deny_latest:
+        description: "If true, prevent deploying image_tag=latest"
+        required: false
+        default: true
+        type: boolean
+      smoke_url:
+        description: "Relative URL path for smoke test (e.g., /healthz)"
+        required: false
+        default: "/"
+        type: string
+      smoke_timeout:
+        description: "Timeout seconds for smoke test"
+        required: false
+        default: 90
+        type: number
+      base_url:
+        description: "Absolute base URL for smoke test (optional)"
+        required: false
+        type: string
+      smoke_port:
+        description: "Local port used when base_url is absent"
+        required: false
+        default: 8000
+        type: number
+    secrets:
+      GHCR_PAT:
+        required: true
+
+jobs:
+  deploy:
+    name: Pull image and compose up (no-build)
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate image_tag
+        if: inputs.deny_latest == true
+        shell: bash
+        run: |
+          if [ "${{ inputs.image_tag }}" = "latest" ]; then
+            echo "Refusing to deploy 'latest' when deny_latest=true" >&2
+            exit 1
+          fi
+
+      - name: Docker login (read)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.image_registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Export environment
+        id: envs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "IMAGE_REGISTRY=${{ inputs.image_registry }}" >> $GITHUB_ENV
+          echo "IMAGE_REPO=${{ inputs.image_repo }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          if [ -n "${{ inputs.compose_project_name }}" ]; then
+            echo "COMPOSE_PROJECT_NAME=${{ inputs.compose_project_name }}" >> $GITHUB_ENV
+          fi
+          if [ -n "${{ inputs.extra_env }}" ]; then
+            IFS=',' read -ra A <<< "${{ inputs.extra_env }}"
+            for kv in "${A[@]}"; do
+              kv=$(echo "$kv" | xargs)
+              [ -z "$kv" ] && continue
+              echo "$kv" >> $GITHUB_ENV
+            done
+          fi
+
+      - name: Compose pull
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra FS <<< "${{ inputs.compose_files }}"
+          CMD=(docker compose)
+          for f in "${FS[@]}"; do
+            f=$(echo "$f" | xargs)
+            [ -z "$f" ] && continue
+            CMD+=( -f "$f" )
+          done
+          "${CMD[@]}" pull
+
+      - name: Compose up (no-build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra FS <<< "${{ inputs.compose_files }}"
+          CMD=(docker compose)
+          for f in "${FS[@]}"; do
+            f=$(echo "$f" | xargs)
+            [ -z "$f" ] && continue
+            CMD+=( -f "$f" )
+          done
+          "${CMD[@]}" up -d --no-build
+
+      - name: Smoke test (curl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.base_url }}" ]; then
+            URL="${{ inputs.base_url }}${{ inputs.smoke_url }}"
+          else
+            URL="http://127.0.0.1:${{ inputs.smoke_port }}${{ inputs.smoke_url }}"
+          fi
+          end=$((SECONDS+${{ inputs.smoke_timeout }}))
+          until curl -fsS "$URL" >/dev/null; do
+            [ $SECONDS -ge $end ] && { echo "Smoke failed for $URL"; exit 1; }
+            sleep 3
+          done
